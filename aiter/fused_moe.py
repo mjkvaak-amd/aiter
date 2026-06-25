@@ -230,6 +230,38 @@ def get_topk_valid_mask(
     return expert_mask[topk_ids]
 
 
+def ep_tune_lookup_topk(
+    topk: int,
+    expert_mask: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+) -> int:
+    """Return ``topk`` for tuned FMoE config lookup.
+
+    Under EP, runtime ``topk_ids`` width is not always equal to the routed
+    topk that tuning used as a lookup key:
+
+    * DSv3 / SGLang append one always-masked fake-expert column so
+      ``topk_ids.shape[-1] == routed_topk + 1``; tuned rows are keyed on
+      ``routed_topk``.
+    * vLLM / GLM pass ``topk_ids`` with width equal to routed topk and no
+      fake column.
+
+    Detect the fake column via the DSv3 convention (last column always
+    points at ``expert_mask.numel() - 1``) instead of assuming every EP run
+    inflates topk by one.
+    """
+    if expert_mask is None or topk_ids is None or topk <= 1:
+        return topk
+    if topk_ids.shape[0] == 0:
+        return topk
+    fake_id = expert_mask.numel() - 1
+    if expert_mask[fake_id].item() != 0:
+        return topk
+    if (topk_ids[:, -1] == fake_id).all():
+        return topk - 1
+    return topk
+
+
 def is_flydsl_stage2_reduce(stage2: Callable) -> bool:
     """Return True iff `stage2` is the FlyDSL stage2 wrapper compiled in
     reduce mode (i.e. its kernelName parses to ``mode == "reduce"``).
@@ -481,7 +513,7 @@ def fused_moe_(
         model_dim,
         inter_dim,
         E,
-        topk,
+        ep_tune_lookup_topk(topk, expert_mask, topk_ids),
         dtype,
         q_dtype_a,
         q_dtype_w,
@@ -493,7 +525,7 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        is_ep=expert_mask is not None,
+        runtime_topk=topk if expert_mask is not None else None,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -1053,7 +1085,7 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
-    is_ep=False,
+    runtime_topk=None,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -1167,10 +1199,6 @@ def get_2stage_cfgs(
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
     keys = (
         gfx,
         cu_num,
@@ -1229,23 +1257,49 @@ def get_2stage_cfgs(
         if not c2s:
             return None
         primary, fallback = c2s
-        result = primary.get(keys, None)
-        if result is None:
-            result = fallback.get(keys_disabled, None)
-        # Tier fallback: if current tier not found, try smaller tiers in descending order
-        if result is None and token > _PADDED_M_TIERS[0]:
-            tier_idx = _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
-            for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
-                # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
-                keys_fb = keys[:2] + (fallback_tier,) + keys[3:]
-                keys_fb_disabled = (
-                    keys_disabled[:2] + (fallback_tier,) + keys_disabled[3:]
+
+        def _lookup_keys(lookup_keys):
+            result = primary.get(lookup_keys, None)
+            if result is None:
+                lookup_keys_disabled = (
+                    lookup_keys[:2]
+                    + lookup_keys[2:7]
+                    + (_ACT_TYPE_DISABLED_KEY,)
+                    + lookup_keys[8:]
                 )
-                result = primary.get(keys_fb, None)
-                if result is None:
-                    result = fallback.get(keys_fb_disabled, None)
-                if result is not None:
-                    break
+                result = fallback.get(lookup_keys_disabled, None)
+            return result
+
+        def _lookup_with_tier_fallback(lookup_keys):
+            result = _lookup_keys(lookup_keys)
+            if result is None and token > _PADDED_M_TIERS[0]:
+                tier_idx = (
+                    _PADDED_M_TIERS.index(token) if token in _PADDED_M_TIERS else -1
+                )
+                for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
+                    # keys layout: (gfx, cu_num, token, ...); replace token (idx 2).
+                    keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
+                    result = _lookup_keys(keys_fb)
+                    if result is not None:
+                        break
+            return result
+
+        result = _lookup_with_tier_fallback(keys)
+        if (
+            result is None
+            and runtime_topk is not None
+            and runtime_topk != topk
+        ):
+            alt_keys = keys[:6] + (runtime_topk,) + keys[7:]
+            result = _lookup_with_tier_fallback(alt_keys)
+        elif (
+            result is None
+            and runtime_topk is not None
+            and runtime_topk == topk
+            and topk > 1
+        ):
+            alt_keys = keys[:6] + (topk - 1,) + keys[7:]
+            result = _lookup_with_tier_fallback(alt_keys)
         return result
 
     cfg = _lookup_cfg(cfg_2stages)
@@ -1778,7 +1832,7 @@ def fused_moe_2stages(
         model_dim,
         inter_dim,
         E,
-        topk,
+        ep_tune_lookup_topk(topk, expert_mask, topk_ids),
         dtype,
         q_dtype_a,
         q_dtype_w,
@@ -1790,7 +1844,7 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
-        is_ep=expert_mask is not None,
+        runtime_topk=topk if expert_mask is not None else None,
     )
     if (
         quant_type == QuantType.per_1x32

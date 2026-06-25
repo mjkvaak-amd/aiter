@@ -18,6 +18,8 @@ import os
 import tempfile
 import unittest
 
+import torch
+
 SAMPLE_KEYS = (
     256,
     16,
@@ -432,6 +434,35 @@ class TestGetCfg2stages(unittest.TestCase):
             self.assertEqual(cfg["kernelName1"], "ck_k1")
         finally:
             os.unlink(path)
+
+
+class TestEpTuneLookupTopk(unittest.TestCase):
+    def test_non_ep_returns_runtime_topk(self):
+        from aiter.fused_moe import ep_tune_lookup_topk
+
+        topk_ids = torch.tensor([[1, 2, 3]], dtype=torch.int32)
+        self.assertEqual(ep_tune_lookup_topk(8, None, topk_ids), 8)
+
+    def test_vllm_style_ep_keeps_runtime_topk(self):
+        from aiter.fused_moe import ep_tune_lookup_topk
+
+        expert_mask = torch.tensor([1, 0, 1, 0], dtype=torch.int32)
+        topk_ids = torch.tensor(
+            [[0, 2, 0, 2, 0, 2, 0, 2], [2, 0, 2, 0, 2, 0, 2, 0]],
+            dtype=torch.int32,
+        )
+        self.assertEqual(ep_tune_lookup_topk(8, expert_mask, topk_ids), 8)
+
+    def test_dsv3_style_fake_slot_strips_one(self):
+        from aiter.fused_moe import ep_tune_lookup_topk
+
+        expert_mask = torch.tensor([0, 1, 1, 0, 1, 0], dtype=torch.int32)
+        fake_id = expert_mask.numel() - 1
+        topk_ids = torch.tensor(
+            [[1, 4, 1, fake_id], [4, 1, 4, fake_id]],
+            dtype=torch.int32,
+        )
+        self.assertEqual(ep_tune_lookup_topk(4, expert_mask, topk_ids), 3)
 
 
 if __name__ == "__main__":
