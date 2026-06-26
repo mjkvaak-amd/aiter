@@ -481,7 +481,7 @@ def fused_moe_(
         model_dim,
         inter_dim,
         E,
-        topk,
+        ep_tune_lookup_topk(topk, expert_mask, topk_ids),
         dtype,
         q_dtype_a,
         q_dtype_w,
@@ -493,7 +493,6 @@ def fused_moe_(
         intermediate_pad,
         isShuffled,
         gate_mode,
-        is_ep=expert_mask is not None,
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -1035,6 +1034,38 @@ def _flydsl_stage2_wrapper(
     )
 
 
+def ep_tune_lookup_topk(
+    topk: int,
+    expert_mask: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+) -> int:
+    """Return ``topk`` for tuned FMoE config lookup.
+
+    Under EP, runtime ``topk_ids`` width is not always equal to the routed
+    topk that tuning used as a lookup key:
+
+    * DSv3 / SGLang append one always-masked fake-expert column so
+      ``topk_ids.shape[-1] == routed_topk + 1``; tuned rows are keyed on
+      ``routed_topk``.
+    * vLLM / GLM pass ``topk_ids`` with width equal to routed topk and no
+      fake column.
+
+    Detect the fake column via the DSv3 convention (last column always
+    points at ``expert_mask.numel() - 1``) instead of assuming every EP run
+    inflates topk by one.
+    """
+    if expert_mask is None or topk_ids is None or topk <= 1:
+        return topk
+    if topk_ids.shape[0] == 0:
+        return topk
+    fake_id = expert_mask.numel() - 1
+    if expert_mask[fake_id].item() != 0:
+        return topk
+    if (topk_ids[:, -1] == fake_id).all():
+        return topk - 1
+    return topk
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -1053,7 +1084,6 @@ def get_2stage_cfgs(
     intermediate_pad,
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
-    is_ep=False,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -1167,10 +1197,11 @@ def get_2stage_cfgs(
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+
+    # `topk` here is the routed topk the tuned rows are keyed on. EP callers
+    # whose topk_ids carry an extra fake-expert column must normalize it before
+    # calling (see ``ep_tune_lookup_topk``), so no EP-specific adjustment is
+    # needed in this lookup.
     keys = (
         gfx,
         cu_num,
@@ -1778,7 +1809,7 @@ def fused_moe_2stages(
         model_dim,
         inter_dim,
         E,
-        topk,
+        ep_tune_lookup_topk(topk, expert_mask, topk_ids),
         dtype,
         q_dtype_a,
         q_dtype_w,
@@ -1790,7 +1821,6 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
         gate_mode,
-        is_ep=expert_mask is not None,
     )
     if (
         quant_type == QuantType.per_1x32
