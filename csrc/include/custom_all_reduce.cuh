@@ -2089,6 +2089,147 @@ __global__ void __launch_bounds__(1024, 1)
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// Injection weight for one HyperConnection stream: 2 * sigmoid(logit / hc).
+//
+// Written as the precise 1 / (1 + expf(-x)) rather than __expf's fast
+// approximation. The result scales a value that is then rounded to T, so an
+// approximate sigmoid can move the rounded sum by a ULP, and the unfused Triton
+// kernel this has to match uses tl.sigmoid.
+DINLINE opus::fp32_t hc_injection_scale(opus::fp32_t logit, int hc_count)
+{
+    return 2.f / (1.f + expf(-logit / (opus::fp32_t)hc_count));
+}
+
+// HyperConnection combine variant of the 1-stage fused allreduce+rmsnorm
+// kernel, for Qwen3.8-Flash-Next.
+//
+// The gated residual around each block consumes a tensor-parallel reduction of
+// that block's output, so the pattern is the same allreduce -> add -> norm this
+// file already fuses, with three differences:
+//
+//   1. the reduced row is broadcast. The reduction is over [m, hidden_dim] but
+//      the state is [m, hc * hidden_dim]: every one of the hc streams adds the
+//      same reduced row;
+//   2. each stream scales it by its own 2 * sigmoid(logit / hc), derived from
+//      an [m, hc] tensor of injection logits; and
+//   3. the norm is per stream, over hidden_dim, with its own hidden_dim slice
+//      of an [hc * hidden_dim] weight.
+//
+// (3) is free: the group size *is* the reduction width, so normalizing each
+// stream is just the existing per-row norm applied to a row of the reshaped
+// state. Nothing about ar_fusion_epilogue_rms_norm changes.
+//
+// (1) is the reason this is a separate kernel rather than a template flag. The
+// block-to-row mapping elsewhere in this file is 1:1 -- one block per token
+// row. Keeping that and launching hc times the blocks would make each of the hc
+// blocks re-read every peer's copy of the same row, multiplying the collective's
+// traffic by hc to save a launch, which is a losing trade: the collective is
+// the more expensive half of the pair. So the grid stays one block per token,
+// the reduction happens once, and the block loops the epilogue over the hc
+// streams -- the same shape allreduce_mhc_post_large_m_kernel below uses for
+// the post-layer mix.
+//
+// Launch with blockDim.x == hidden_dim / pack_size, as that kernel does, so
+// every lane is active and the norm's block reduction spans exactly the row.
+// The two_way trick it uses to process two streams per block does not
+// transfer as-is: the norm reduction would have to be scoped to a thread
+// group rather than the block. Worth revisiting if occupancy is the limiter.
+//
+// Numerics: the unfused path rounds the combined sum to T *and normalizes the
+// rounded value*. That differs from the plain fused kernel above, which rounds
+// the reduced value before adding the residual and then normalizes the f32 sum.
+// Both roundings are kept here, and the norm reads the rounded sum, because the
+// rounding boundary is what the unfused Triton kernel matches and a 1-ULP
+// divergence per stream compounds over 95 boundaries a step.
+// Output is T. There is no quantized flavour: the normed state feeds the HC
+// low-rank down projection, which is unquantized on this model.
+template <typename T, int ngpus, bool GEMMA_NORM = false>
+__global__ void __launch_bounds__(1024, 1)
+    allreduce_fusion_kernel_1stage_hc_combine(RankData* _dp,
+                                              RankSignals sg,
+                                              Signal* self_sg,
+                                              int rank,
+                                              T* __restrict__ residual_inp,
+                                              T* __restrict__ residual_out,
+                                              T* __restrict__ output,
+                                              T* __restrict__ weight,
+                                              const T* __restrict__ injection_logits,
+                                              int size,
+                                              int hidden_dim,
+                                              int hc_count,
+                                              float eps)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    int block_size          = hidden_dim / pack_size;
+    bool active             = (int)threadIdx.x < block_size;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int token_num           = size / hidden_dim;
+    int access_id_in_token  = threadIdx.x * pack_size;
+    const P* ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    start_sync<ngpus>(sg, self_sg, rank);
+    for(int tidx = blockIdx.x; tidx < token_num; tidx += gridDim.x)
+    {
+        int input_idx = tidx * hidden_dim + access_id_in_token;
+
+        // packed_reduce returns T, so the round-trip through the activation
+        // dtype that the unfused path gets from materializing the all-reduce
+        // output comes for free.
+        A reduced{};
+        if(active)
+        {
+            P reduced_pack = packed_reduce<P, ngpus, A>(ptrs, input_idx / pack_size);
+#pragma unroll
+            for(int v = 0; v < pack_size; ++v)
+            {
+                reduced[v] = upcast_s(reduced_pack[v]);
+            }
+        }
+
+        // One reduction, hc epilogues. Every thread runs every iteration: the
+        // norm's block reduction syncs, so the trip count has to be uniform
+        // across the block, and the padded threads contribute a zero row.
+        for(int s = 0; s < hc_count; ++s)
+        {
+            int stream_idx = (tidx * hc_count + s) * hidden_dim + access_id_in_token;
+
+            A acc{};
+            P weight_p{};
+            if(active)
+            {
+                float scale = hc_injection_scale(
+                    upcast_s(injection_logits[tidx * hc_count + s]), hc_count);
+                P res = *reinterpret_cast<P*>(residual_inp + stream_idx);
+                P vec{};
+#pragma unroll
+                for(int v = 0; v < pack_size; ++v)
+                {
+                    vec[v] = downcast_s<T>(upcast_s(res[v]) + reduced[v] * scale);
+                }
+                *reinterpret_cast<P*>(residual_out + stream_idx) = vec;
+                // Normalize what was stored, not the f32 sum it came from.
+#pragma unroll
+                for(int v = 0; v < pack_size; ++v)
+                {
+                    acc[v] = upcast_s(vec[v]);
+                }
+                weight_p = *reinterpret_cast<P*>(weight + s * hidden_dim + access_id_in_token);
+            }
+
+            P normed;
+            ar_fusion_epilogue_rms_norm<P, A, P, T, pack_size, 32, GEMMA_NORM>(
+                normed, acc, weight_p, eps, hidden_dim, (int)blockDim.x);
+            if(active)
+                *reinterpret_cast<P*>(output + stream_idx) = normed;
+        }
+    }
+}
+
 // Per-group quant variant of the 1-stage fused allreduce+rmsnorm kernel.
 // scale_out shape: (m, hidden_dim / group_size) instead of (m, 1).
 template <typename T, typename OutT, int ngpus, bool GEMMA_NORM = false, bool TRANSPOSE_SCALE = false>
@@ -2488,6 +2629,46 @@ void allreduce_fusion_kernel_1stage_launcher(RankData* _dp,
                                                     out_hidden_dim,
                                                     eps,
                                                     bf16_output);
+}
+
+template <typename T, int NGPUS, bool GEMMA_NORM = false>
+void allreduce_fusion_kernel_1stage_hc_combine_launcher(RankData* _dp,
+                                                        RankSignals sg,
+                                                        Signal* self_sg,
+                                                        int rank,
+                                                        T* residual_inp,
+                                                        T* residual_out,
+                                                        T* output,
+                                                        T* weight,
+                                                        const T* injection_logits,
+                                                        int size,
+                                                        int hidden_dim,
+                                                        int hc_count,
+                                                        float eps,
+                                                        hipStream_t stream)
+{
+    constexpr int PACK_SIZE = 16 / sizeof(T);
+    constexpr int WARP_SIZE = 32;
+    int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
+    // pad to next multiple of WARP_SIZE for correct block reduction
+    int LAUNCH_THREADS = ((BLOCK_SIZE + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    dim3 threadsPerBlock(LAUNCH_THREADS);
+    int token_num = size / hidden_dim;
+    dim3 numBlocks(std::min(token_num, kMaxBlocks));
+    allreduce_fusion_kernel_1stage_hc_combine<T, NGPUS, GEMMA_NORM>
+        <<<numBlocks, threadsPerBlock, 0, stream>>>(_dp,
+                                                    sg,
+                                                    self_sg,
+                                                    rank,
+                                                    residual_inp,
+                                                    residual_out,
+                                                    output,
+                                                    weight,
+                                                    injection_logits,
+                                                    size,
+                                                    hidden_dim,
+                                                    hc_count,
+                                                    eps);
 }
 
 template <typename T, int PACK_SIZE>
