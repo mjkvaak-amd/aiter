@@ -5097,6 +5097,75 @@ void dispatchAllGather(
     }
 }
 
+// Fused allreduce + HyperConnection combine-norm.
+//
+// 1-stage only. The 2-stage path reduce-scatters and then norms from the IPC
+// tmp buffer, and there the hc broadcast would have to be replicated across
+// the scatter shards; the combine runs at every layer boundary in decode,
+// where m is small and 1-stage is the path taken anyway. Callers get a throw
+// rather than a silent fallback so a shape that misses the fast path is
+// visible instead of quietly slower than the unfused pair.
+template <typename T>
+void dispatchFusedAllReduceHCCombineNorm(hipStream_t stream,
+                                         T* input,
+                                         T* residual_inp,
+                                         T* residual_out,
+                                         T* output,
+                                         T* weight,
+                                         const T* injection_logits,
+                                         float eps,
+                                         int m,
+                                         int n,
+                                         int hc_count,
+                                         bool gemma_norm = false)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    int size                = m * n;
+    if(n % pack_size != 0)
+    {
+        throw std::runtime_error("fused allreduce hc combine-norm requires hidden_dim divisible "
+                                 "by pack_size=" +
+                                 std::to_string(pack_size));
+    }
+    if(n / pack_size > 1024)
+    {
+        throw std::runtime_error(
+            "fused allreduce hc combine-norm requires hidden_dim/pack_size <= 1024, got " +
+            std::to_string(n / pack_size));
+    }
+    if(hc_count < 1)
+    {
+        throw std::runtime_error("fused allreduce hc combine-norm requires hc_count >= 1");
+    }
+    RankData* ptrs = get_buffer_RD(stream, input);
+
+#define DISPATCH_1S_HC_COMBINE(NGPUS)                                                       \
+    if(gemma_norm)                                                                          \
+    {                                                                                       \
+        allreduce_fusion_kernel_1stage_hc_combine_launcher<T, NGPUS, true>(                 \
+            ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,         \
+            injection_logits, size, n, hc_count, eps, stream);                              \
+    }                                                                                       \
+    else                                                                                    \
+    {                                                                                       \
+        allreduce_fusion_kernel_1stage_hc_combine_launcher<T, NGPUS, false>(                \
+            ptrs, sg_, self_sg_, rank_, residual_inp, residual_out, output, weight,         \
+            injection_logits, size, n, hc_count, eps, stream);                              \
+    }
+
+    switch(world_size_)
+    {
+    case 8: DISPATCH_1S_HC_COMBINE(8); break;
+    case 4: DISPATCH_1S_HC_COMBINE(4); break;
+    case 2: DISPATCH_1S_HC_COMBINE(2); break;
+    default:
+        throw std::runtime_error("fused allreduce hc combine-norm: unsupported world_size=" +
+                                 std::to_string(world_size_));
+    }
+
+#undef DISPATCH_1S_HC_COMBINE
+}
+
 template <typename T>
 void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    T* input,
