@@ -102,6 +102,23 @@ def fused_allreduce_rmsnorm_pad(
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
+def fused_allreduce_hc_combine_norm(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    injection_logits: torch.Tensor,
+    eps: float,
+    hc_count: int,
+    reg_ptr: int,
+    reg_bytes: int,
+    gemma_norm: bool = False,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
 def fused_allreduce_rmsnorm_quant(
     _fa: int,
     inp: torch.Tensor,

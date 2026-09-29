@@ -610,6 +610,109 @@ void fused_allreduce_rmsnorm_pad(fptr_t _fa,
     }
 }
 
+static void _fused_allreduce_hc_combine_norm(fptr_t _fa,
+                                             void* inp, void* residual_inp,
+                                             void* residual_out, void* out,
+                                             void* w, const void* injection_logits,
+                                             AiterDtype dtype, float eps,
+                                             int m, int n, int hc_count,
+                                             bool gemma_norm)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+
+#define DISPATCH_AR_HC_COMBINE(DTYPE)                                     \
+    fa->dispatchFusedAllReduceHCCombineNorm<DTYPE>(                       \
+        stream,                                                           \
+        reinterpret_cast<DTYPE*>(inp),                                    \
+        reinterpret_cast<DTYPE*>(residual_inp),                           \
+        reinterpret_cast<DTYPE*>(residual_out),                           \
+        reinterpret_cast<DTYPE*>(out),                                    \
+        reinterpret_cast<DTYPE*>(w),                                      \
+        reinterpret_cast<const DTYPE*>(injection_logits),                 \
+        eps,                                                              \
+        m,                                                                \
+        n,                                                                \
+        hc_count,                                                         \
+        gemma_norm);
+
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp16: {
+        DISPATCH_AR_HC_COMBINE(opus::fp16_t)
+        break;
+    }
+#if(__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        DISPATCH_AR_HC_COMBINE(opus::bf16_t)
+        break;
+    }
+#endif
+    default:
+        throw std::runtime_error(
+            "fused allreduce hc combine-norm only supports float16 and bfloat16");
+    }
+
+#undef DISPATCH_AR_HC_COMBINE
+}
+
+// Fused allreduce + HyperConnection combine-norm.
+//
+// inp              [m, n]          the block output to reduce over TP ranks
+// res_inp/res_out  [m, hc * n]     HC residual state in, combined state out
+// out              [m, hc * n]     per-stream RMS-normed combined state
+// w                [hc * n]        per-branch norm weight, one n-slice per stream
+// injection_logits [m, hc]         pre-sigmoid gates
+//
+// res_out and out are separate because the unfused path materializes the
+// combined state for the next layer's residual and normalizes a copy of it.
+void fused_allreduce_hc_combine_norm(fptr_t _fa,
+                                     const aiter_tensor_t& inp,
+                                     const aiter_tensor_t& res_inp,
+                                     const aiter_tensor_t& res_out,
+                                     const aiter_tensor_t& out,
+                                     const aiter_tensor_t& w,
+                                     const aiter_tensor_t& injection_logits,
+                                     double eps,
+                                     int64_t hc_count,
+                                     int64_t reg_ptr, int64_t reg_bytes,
+                                     bool gemma_norm)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto dtype         = inp.dtype();
+    int n   = (int)inp.size(-1);
+    int m   = (int)(inp.numel() / n);
+    int hc  = (int)hc_count;
+
+    if(hc < 1)
+        throw std::runtime_error("fused allreduce hc combine-norm requires hc_count >= 1");
+    if((int)w.numel() != hc * n)
+        throw std::runtime_error(
+            "fused allreduce hc combine-norm requires weight width == hc_count * hidden_dim");
+    if((int)res_inp.size(-1) != hc * n || (int)res_out.size(-1) != hc * n ||
+       (int)out.size(-1) != hc * n)
+        throw std::runtime_error("fused allreduce hc combine-norm requires residual/output width "
+                                 "== hc_count * hidden_dim");
+    if((int)injection_logits.numel() != m * hc)
+        throw std::runtime_error(
+            "fused allreduce hc combine-norm requires injection_logits of shape (m, hc_count)");
+    if(injection_logits.dtype() != dtype)
+        throw std::runtime_error(
+            "fused allreduce hc combine-norm requires injection_logits to match the input dtype");
+
+    void* inp_ptr = inp.data_ptr();
+    if(reg_ptr != 0)
+    {
+        _copy_input_to_registered_buffer(inp, m, n, stream, reg_ptr, reg_bytes);
+        inp_ptr = (void*)reg_ptr;
+    }
+    _fused_allreduce_hc_combine_norm(_fa,
+                                     inp_ptr, res_inp.data_ptr(), res_out.data_ptr(),
+                                     out.data_ptr(), w.data_ptr(), injection_logits.data_ptr(),
+                                     dtype, (float)eps, m, n, hc, gemma_norm);
+}
+
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& inp,
                                    const aiter_tensor_t& res_inp,

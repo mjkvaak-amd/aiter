@@ -1624,6 +1624,80 @@ class CustomAllreduce:
                 gemma_norm=gemma_norm,
             )
 
+    def fused_ar_hc_combine_norm(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        *,
+        w: torch.Tensor,
+        injection_logits: torch.Tensor,
+        eps: float,
+        hc_count: int,
+        registered: bool = False,
+        gemma_norm: bool = False,
+    ):
+        out = torch.empty_like(res_inp)
+        res_out = torch.empty_like(res_inp)
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        ops.fused_allreduce_hc_combine_norm(
+            self._ptr,
+            inp,
+            res_inp,
+            res_out,
+            out,
+            w,
+            injection_logits,
+            eps,
+            hc_count,
+            reg,
+            reg_bytes,
+            gemma_norm,
+        )
+        return out, res_out
+
+    def custom_fused_ar_hc_combine_norm(
+        self,
+        input: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        injection_logits: torch.Tensor,
+        eps: float,
+        hc_count: int,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        # when custom allreduce is disabled, this will be None
+        if self.disabled or not self.should_custom_ar(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.fused_ar_hc_combine_norm(
+                    input,
+                    residual_inp,
+                    w=weight,
+                    injection_logits=injection_logits,
+                    eps=eps,
+                    hc_count=hc_count,
+                    registered=True,
+                    gemma_norm=gemma_norm,
+                )
+            else:
+                return (
+                    torch.zeros_like(residual_inp),
+                    torch.zeros_like(residual_inp),
+                )
+        else:
+            return self.fused_ar_hc_combine_norm(
+                input,
+                residual_inp,
+                w=weight,
+                injection_logits=injection_logits,
+                eps=eps,
+                hc_count=hc_count,
+                registered=False,
+                gemma_norm=gemma_norm,
+            )
+
     def custom_fused_ar_rms_packed_input(
         self,
         input: torch.Tensor,
