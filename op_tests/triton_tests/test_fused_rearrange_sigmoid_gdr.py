@@ -213,3 +213,93 @@ def test_fused_rearrange_sigmoid_gdr_sweep(
         assert torch.isfinite(h_tr.float()).all(), "non-finite Triton final_state"
     torch.testing.assert_close(o_tr.float(), o_ref, rtol=rtol, atol=atol)
     torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=rtol, atol=atol)
+
+
+def _ref_gated_rmsnorm(o, weight, gate, eps, activation):
+    o = o.float()
+    o = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+    g = gate.float()
+    return o * (
+        torch.sigmoid(g) if activation == "sigmoid" else torch.nn.functional.silu(g)
+    )
+
+
+@cuda_ok
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize("gate_2d", [False, True])
+@pytest.mark.parametrize(
+    "T,H,HV,D", [(1, 2, 4, 128), (4, 4, 8, 128), (6, 8, 24, 128), (5, 2, 2, 64)]
+)
+def test_fused_rearrange_sigmoid_gdr_gated_norm(T, H, HV, D, activation, gate_2d):
+    """Decode-style call (one token per sequence, in-place state) with the
+    gated RMSNorm epilogue against the float reference + a torch gated norm."""
+    device, dtype = "cuda", torch.bfloat16
+    K = V = D
+    key_dim, value_dim = H * K, HV * V
+    eps = 1e-6
+    torch.manual_seed(T * 100 + HV)
+    qkv = torch.randn(T, key_dim * 2 + value_dim, device=device, dtype=dtype) * 0.05
+    A_log = torch.randn(HV, device=device, dtype=torch.float32).clamp(-2.0, 0.5) * 0.02
+    a = (torch.randn(T, HV, device=device, dtype=dtype) * 0.05).clamp(-1.0, 1.0)
+    b_gate = (torch.randn(T, HV, device=device, dtype=dtype) * 0.05).clamp(-1.0, 1.0)
+    dt_bias = (torch.randn(HV, device=device, dtype=dtype) * 0.005).clamp(-0.5, 0.5)
+    weight = 1.0 + 0.1 * torch.randn(V, device=device, dtype=dtype)
+    # z lives in a wider buffer, as the qkvz split hands it over.
+    z_buf = torch.randn(T, HV, V + 16, device=device, dtype=dtype)
+    z = z_buf[..., :V]
+    if gate_2d:
+        z = z.contiguous().view(T, HV * V)
+    num_slots = T + 3
+    state = torch.randn(num_slots, HV, V, K, device=device, dtype=dtype) * 0.05
+    slots = torch.randperm(num_slots, device=device)[:T].to(torch.int32)
+    state_ref = state.clone()
+    cu_seqlens = torch.arange(T + 1, device=device, dtype=torch.int32)
+
+    o_ref = torch.empty(T, HV, V, device=device, dtype=torch.float32)
+    for t in range(T):
+        o_t, h_t = ref_fused_rearrange_sigmoid_gdr(
+            A_log,
+            a[t : t + 1],
+            b_gate[t : t + 1],
+            dt_bias,
+            qkv[t : t + 1],
+            key_dim,
+            value_dim,
+            K,
+            V,
+            1.0,
+            20.0,
+            K**-0.5,
+            state_ref[slots[t].item()].unsqueeze(0),
+            True,
+        )
+        o_ref[t] = o_t[0, 0]
+        state_ref[slots[t].item()] = h_t[0].to(dtype)
+    expected = _ref_gated_rmsnorm(o_ref, weight, z.reshape(T, HV, V), eps, activation)
+
+    core = torch.empty(T, HV, V, device=device, dtype=dtype)
+    o_tr, _ = fused_rearrange_sigmoid_gated_delta_rule(
+        A_log,
+        a,
+        b_gate,
+        dt_bias,
+        qkv,
+        key_dim,
+        value_dim,
+        K,
+        V,
+        initial_state=state,
+        inplace_final_state=True,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=slots,
+        use_qk_l2norm_in_kernel=True,
+        core_attn_out=core,
+        norm_weight=weight,
+        norm_eps=eps,
+        gate=z,
+        gate_activation=activation,
+    )
+    torch.testing.assert_close(
+        o_tr.reshape(T, HV, V).float(), expected, rtol=0.03, atol=0.03
+    )
+    torch.testing.assert_close(state.float(), state_ref.float(), rtol=0.05, atol=0.02)
