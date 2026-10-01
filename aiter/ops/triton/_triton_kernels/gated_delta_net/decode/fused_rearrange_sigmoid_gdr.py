@@ -18,6 +18,7 @@ import triton.language as tl
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "FUSE_GATED_NORM": lambda args: args["norm_weight"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -36,6 +37,9 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     ssm_state_indices,
     num_accepted_tokens,
     scale,
+    norm_weight,
+    gate,
+    norm_eps,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
     B: tl.constexpr,
@@ -51,6 +55,8 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    stride_gate_tok: tl.constexpr,
+    stride_gate_head: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
@@ -58,6 +64,8 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
     IS_KDA: tl.constexpr,
+    FUSE_GATED_NORM: tl.constexpr,
+    GATE_SIGMOID: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -97,6 +105,11 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_v[:, None] & mask_k[None, :]
+
+    if FUSE_GATED_NORM:
+        # The wrapper launches one program per head (BV >= V) for the norm.
+        p_gate = gate + bos * stride_gate_tok + i_hv * stride_gate_head + o_v
+        b_w = tl.load(norm_weight + o_v, mask=mask_v, other=0).to(tl.float32)
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -142,6 +155,15 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         b_v *= b_beta
         b_h += b_v[:, None] * b_k[None, :]
         b_o = tl.sum(b_h * b_q[None, :], 1)
+        if FUSE_GATED_NORM:
+            b_o = tl.where(mask_v, b_o, 0.0)
+            b_o *= tl.rsqrt(tl.sum(b_o * b_o) / V + norm_eps) * b_w
+            b_z = tl.load(p_gate, mask=mask_v, other=0).to(tl.float32)
+            if GATE_SIGMOID:
+                b_o *= tl.sigmoid(b_z)
+            else:
+                b_o *= b_z * tl.sigmoid(b_z)
+            p_gate += stride_gate_tok
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         if INPLACE_FINAL_STATE:

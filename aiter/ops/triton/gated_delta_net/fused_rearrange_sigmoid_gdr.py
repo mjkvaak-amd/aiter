@@ -205,11 +205,20 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     is_kda: bool = False,
     core_attn_out: torch.Tensor | None = None,
     draft_window: int | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+    gate: torch.Tensor | None = None,
+    gate_activation: str = "silu",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused sigmoid-gated delta rule over packed QKV.
 
     ``draft_window`` is host metadata required for FlyDSL dispatch. FlyDSL
     falls back to Triton during CUDA Graph capture.
+
+    With ``norm_weight`` the output is ``rmsnorm(o) * norm_weight * act(gate)``
+    per value head (the Qwen3-Next / Qwen3.5 gated RMSNorm with
+    ``norm_before_gate=True``), where ``gate`` is ``[T, HV, V]`` or
+    ``[T, HV * V]`` and ``act`` is ``"silu"`` or ``"sigmoid"``.
     """
     # Spelled as raised ``AssertionError``s rather than ``assert`` statements,
     # keeping the type a caller may already handle while ``python -O`` can no
@@ -231,9 +240,37 @@ def fused_rearrange_sigmoid_gated_delta_rule(
             f"value_dim {value_dim} must be a multiple of head_v_dim {head_v_dim}"
         )
 
+    HV = value_dim // head_v_dim
+    V = head_v_dim
+    fuse_gated_norm = norm_weight is not None
+    stride_gate_tok = stride_gate_head = 0
+    if fuse_gated_norm:
+        if gate is None:
+            raise ValueError("gate is required with norm_weight")
+        if gate_activation not in ("silu", "sigmoid"):
+            raise ValueError(f"unsupported gate_activation {gate_activation!r}")
+        if norm_weight.numel() != V or not norm_weight.is_contiguous():
+            raise ValueError(
+                f"norm_weight must be a contiguous [{V}] tensor, got "
+                f"{tuple(norm_weight.shape)}"
+            )
+        if gate.ndim == 2:
+            gate = gate.view(gate.shape[0], HV, V)
+        if (
+            gate.ndim != 3
+            or gate.shape[0] < qkv.shape[0]
+            or gate.shape[1:] != (HV, V)
+            or gate.stride(2) != 1
+        ):
+            raise ValueError(
+                f"gate must be [T, {HV}, {V}] with unit last stride, got "
+                f"{tuple(gate.shape)} strides {gate.stride()}"
+            )
+        stride_gate_tok, stride_gate_head = gate.stride(0), gate.stride(1)
+
     # FlyDSL port (opt-in). Only the speculative-verify shape is routed;
     # everything else falls through to Triton below unchanged.
-    if _flydsl_gdr_enabled():
+    if _flydsl_gdr_enabled() and not fuse_gated_norm:
         routed = _try_flydsl_mtp(
             A_log=A_log,
             a=a,
@@ -268,16 +305,20 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     B = 1
     T = qkv.shape[0]
     H = key_dim // head_k_dim
-    HV = value_dim // head_v_dim
     K = head_k_dim
-    V = head_v_dim
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    BK = triton.next_power_of_2(K)
+    BV = (
+        triton.next_power_of_2(V)
+        if fuse_gated_norm
+        else min(triton.next_power_of_2(V), 32)
+    )
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 4
+    # A whole head per program: 8 warps beat 4 and 16 at N=1-64 on MI355X.
+    num_warps = 8 if fuse_gated_norm else 4
 
     if inplace_final_state and ssm_state_indices is None:
         raise ValueError(
@@ -328,6 +369,9 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
         scale=scale,
+        norm_weight=norm_weight,
+        gate=gate,
+        norm_eps=norm_eps,
         N=N,
         T=T,
         B=B,
@@ -343,9 +387,12 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_gate_tok=stride_gate_tok,
+        stride_gate_head=stride_gate_head,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
+        GATE_SIGMOID=gate_activation == "sigmoid",
         num_warps=num_warps,
         num_stages=num_stages,
     )
