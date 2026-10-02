@@ -339,7 +339,7 @@ def main():
         "--decode-tokens",
         type=int,
         nargs="+",
-        default=[1, 3, 4, 5, 8, 32],
+        default=[1, 3, 4, 5, 6, 7, 8, 32],
         help="small (decode) token counts; 4/5 pin the skinny<->tail DECODE_MAX_M boundary.",
     )
     args = parser.parse_args()

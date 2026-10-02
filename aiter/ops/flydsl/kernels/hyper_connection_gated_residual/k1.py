@@ -1048,8 +1048,11 @@ def flydsl_k1k2_skinny_decode(
             skinny_two_kernel,
         )
 
-        skinny_impl = skinny_chunked_two_kernel if tokens == 8 else skinny_two_kernel
-        skinny_kwargs = {"chunk_m": 2} if tokens == 8 else {}
+        # From M=3 the one-group kernel loses to grid.y token groups: 2 rows
+        # per group where M is even, 1 where odd (M=5..7 are 18-25% faster).
+        chunked = tokens >= 3
+        skinny_impl = skinny_chunked_two_kernel if chunked else skinny_two_kernel
+        skinny_kwargs = {"chunk_m": 2 if tokens % 2 == 0 else 1} if chunked else {}
         r2, x, packed = skinny_impl(
             residual,
             block_output,
