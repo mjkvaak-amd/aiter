@@ -1640,6 +1640,10 @@ def flydsl_k1_combine_norm_down(
         # than the default 1x4 for the pipelined split-K partial at mid M.
         _sk_mw = dn_m_waves if dn_m_waves is not None else 2
         _sk_nw = dn_n_waves if dn_n_waves is not None else 2
+        # A caller's own padding (vLLM folds to 16 rows: n_pad=336) can leave a
+        # full-width tile that no 2-wave split divides.
+        while _sk_nw > 1 and sk_bn % (_sk_nw * mma.mma_n):
+            _sk_nw //= 2
         if _gfx942_regp_partial:
             part = _build_down_norm_partial(
                 hidden,
@@ -1720,6 +1724,8 @@ def flydsl_k1_combine_norm_down(
         # per-dimension tuning missed. dn_m/n_waves override for tuning.
         _dn_mw = dn_m_waves if dn_m_waves is not None else 2
         _dn_nw = dn_n_waves if dn_n_waves is not None else 2
+        while _dn_nw > 1 and _dn_bn % (_dn_nw * mma.mma_n):
+            _dn_nw //= 2
         downpipe = _build_down_norm_pipe(
             hidden,
             n_pad,
