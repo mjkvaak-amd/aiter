@@ -32,7 +32,8 @@ def _gated_norm_head(
     or with QUANT_MXFP4 its MXFP4 bytes and e8m0 scales (the activation is
     rounded to the output dtype first, as before a separate quant)."""
     offs = tl.arange(0, V)
-    x = tl.load(p_head + offs).to(tl.float32)
+    # Written by other CUs: read through L2, not this CU's L1.
+    x = tl.load(p_head + offs, cache_modifier=".cg").to(tl.float32)
     z = tl.load(p_gate_head + offs).to(tl.float32)
     w = tl.load(norm_weight + offs).to(tl.float32)
     y = x * tl.rsqrt(tl.sum(x * x) / V + norm_eps) * w
@@ -50,6 +51,21 @@ def _gated_norm_head(
         )
     else:
         tl.store(p_head + offs, y)
+
+
+@triton.jit
+def _wait_vmem(x):
+    """s_waitcnt vmcnt(0) in every wave: a workgroup-scope release does not
+    wait for global stores (all its observers share the CU's L1), but the
+    epilogue's reader runs on another CU of the same XCD."""
+    return tl.inline_asm_elementwise(
+        "s_waitcnt vmcnt(0)\n v_mov_b32 $0, $1",
+        "=v,v",
+        [x],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.heuristics(
@@ -111,8 +127,20 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     FUSE_GATED_NORM: tl.constexpr,
     GATE_SIGMOID: tl.constexpr,
     QUANT_MXFP4: tl.constexpr,
+    XCD_LOCAL: tl.constexpr,
 ):
-    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if XCD_LOCAL:
+        # Workgroups are dispatched round-robin over (up to) 8 XCDs, each
+        # with its own L2. Give the NV programs of one (token, head) ids
+        # that are equal mod 8 so they share an L2, which lets the gated-norm
+        # handshake below stay at workgroup scope; a device-scope
+        # release/acquire costs every program an L2 writeback + invalidate.
+        NV: tl.constexpr = V // BV
+        pid = tl.program_id(1) + NV * tl.program_id(2)
+        j = pid % (NV * 8)
+        i_k, i_v, i_nh = 0, j // 8, (pid // (NV * 8)) * 8 + j % 8
+    else:
+        i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
@@ -204,7 +232,11 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
             # launch. No program waits, so residency does not matter.
             i_tok = bos + i_t
             p_cnt = norm_counter + i_tok * HV + i_hv
-            n_in = tl.atomic_add(p_cnt, 1, sem="acq_rel", scope="gpu")
+            if XCD_LOCAL:
+                _wait_vmem(o_v)
+                n_in = tl.atomic_add(p_cnt, 1, sem="acq_rel", scope="cta")
+            else:
+                n_in = tl.atomic_add(p_cnt, 1, sem="acq_rel", scope="gpu")
             if n_in == tl.cdiv(V, BV) - 1:
                 _gated_norm_head(
                     o + ((i_k * all + i_tok) * HV + i_hv) * V,
@@ -218,7 +250,10 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
                     GATE_SIGMOID,
                     QUANT_MXFP4,
                 )
-                tl.atomic_xchg(p_cnt, 0, sem="relaxed", scope="gpu")
+                if XCD_LOCAL:
+                    tl.atomic_xchg(p_cnt, 0, sem="relaxed", scope="cta")
+                else:
+                    tl.atomic_xchg(p_cnt, 0, sem="relaxed", scope="gpu")
 
         if INPLACE_FINAL_STATE:
             final_state_idx = tl.load(

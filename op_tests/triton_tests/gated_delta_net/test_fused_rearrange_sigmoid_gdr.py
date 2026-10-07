@@ -404,7 +404,6 @@ def test_fused_rearrange_sigmoid_gdr_gated_norm_mxfp4(T, H, HV, D, activation):
         y.view(T * HV, V),
         x_fp4=q_ref.view(T * HV, V // 2),
         blockscale_e8m0=s_ref.view(T * HV, V // 32),
-        backend="triton",
     )
     # The fp32 rsqrt differs in the last ulp from torch's, which can move a
     # value across a rounding boundary of the bf16 activation or of E2M1.

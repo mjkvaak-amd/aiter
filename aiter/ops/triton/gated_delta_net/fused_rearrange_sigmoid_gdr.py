@@ -441,6 +441,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
         GATE_SIGMOID=gate_activation == "sigmoid",
+        XCD_LOCAL=norm_weight is not None and (N * HV) % 8 == 0,
         num_warps=num_warps,
         num_stages=num_stages,
     )
