@@ -11,6 +11,46 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+
+
+@triton.jit
+def _gated_norm_head(
+    p_head,
+    p_gate_head,
+    norm_weight,
+    norm_eps,
+    out_fp4,
+    out_scale,
+    i_row,
+    V: tl.constexpr,
+    GATE_SIGMOID: tl.constexpr,
+    QUANT_MXFP4: tl.constexpr,
+):
+    """rmsnorm(o) * w * act(z) over one value head, read back from the
+    rounded output as the unfused norm reads it. Writes the head in place,
+    or with QUANT_MXFP4 its MXFP4 bytes and e8m0 scales (the activation is
+    rounded to the output dtype first, as before a separate quant)."""
+    offs = tl.arange(0, V)
+    x = tl.load(p_head + offs).to(tl.float32)
+    z = tl.load(p_gate_head + offs).to(tl.float32)
+    w = tl.load(norm_weight + offs).to(tl.float32)
+    y = x * tl.rsqrt(tl.sum(x * x) / V + norm_eps) * w
+    if GATE_SIGMOID:
+        y = y * tl.sigmoid(z)
+    else:
+        y = y * z * tl.sigmoid(z)
+    y = y.to(p_head.dtype.element_ty)
+    if QUANT_MXFP4:
+        y_fp4, y_scale = _mxfp4_quant_op(y.to(tl.float32)[None, :], V, 1, 32)
+        tl.store(out_fp4 + i_row * (V // 2) + tl.arange(0, V // 2)[None, :], y_fp4)
+        tl.store(
+            out_scale + i_row * (V // 32) + tl.arange(0, V // 32)[None, :],
+            y_scale.to(out_scale.dtype.element_ty),
+        )
+    else:
+        tl.store(p_head + offs, y)
+
 
 @triton.heuristics(
     {
@@ -19,6 +59,7 @@ import triton.language as tl
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
         "FUSE_GATED_NORM": lambda args: args["norm_weight"] is not None,
+        "QUANT_MXFP4": lambda args: args["out_fp4"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -40,6 +81,9 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     norm_weight,
     gate,
     norm_eps,
+    norm_counter,
+    out_fp4,
+    out_scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
     B: tl.constexpr,
@@ -66,6 +110,7 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     IS_KDA: tl.constexpr,
     FUSE_GATED_NORM: tl.constexpr,
     GATE_SIGMOID: tl.constexpr,
+    QUANT_MXFP4: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -105,11 +150,6 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_v[:, None] & mask_k[None, :]
-
-    if FUSE_GATED_NORM:
-        # The wrapper launches one program per head (BV >= V) for the norm.
-        p_gate = gate + bos * stride_gate_tok + i_hv * stride_gate_head + o_v
-        b_w = tl.load(norm_weight + o_v, mask=mask_v, other=0).to(tl.float32)
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -155,16 +195,30 @@ def fused_rearrange_sigmoid_gated_delta_rule_update_kernel(
         b_v *= b_beta
         b_h += b_v[:, None] * b_k[None, :]
         b_o = tl.sum(b_h * b_q[None, :], 1)
-        if FUSE_GATED_NORM:
-            b_o = tl.where(mask_v, b_o, 0.0)
-            b_o *= tl.rsqrt(tl.sum(b_o * b_o) / V + norm_eps) * b_w
-            b_z = tl.load(p_gate, mask=mask_v, other=0).to(tl.float32)
-            if GATE_SIGMOID:
-                b_o *= tl.sigmoid(b_z)
-            else:
-                b_o *= b_z * tl.sigmoid(b_z)
-            p_gate += stride_gate_tok
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        if FUSE_GATED_NORM:
+            # The head's V outputs are split over the NV programs of this
+            # (token, head). Each counts in after its store; the last one
+            # in normalizes the head and resets the counter for the next
+            # launch. No program waits, so residency does not matter.
+            i_tok = bos + i_t
+            p_cnt = norm_counter + i_tok * HV + i_hv
+            n_in = tl.atomic_add(p_cnt, 1, sem="acq_rel", scope="gpu")
+            if n_in == tl.cdiv(V, BV) - 1:
+                _gated_norm_head(
+                    o + ((i_k * all + i_tok) * HV + i_hv) * V,
+                    gate + i_tok * stride_gate_tok + i_hv * stride_gate_head,
+                    norm_weight,
+                    norm_eps,
+                    out_fp4,
+                    out_scale,
+                    i_tok * HV + i_hv,
+                    V,
+                    GATE_SIGMOID,
+                    QUANT_MXFP4,
+                )
+                tl.atomic_xchg(p_cnt, 0, sem="relaxed", scope="gpu")
 
         if INPLACE_FINAL_STATE:
             final_state_idx = tl.load(

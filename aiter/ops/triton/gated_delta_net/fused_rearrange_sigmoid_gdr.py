@@ -209,6 +209,9 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     norm_eps: float = 1e-6,
     gate: torch.Tensor | None = None,
     gate_activation: str = "silu",
+    norm_counter: torch.Tensor | None = None,
+    out_fp4: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused sigmoid-gated delta rule over packed QKV.
 
@@ -219,6 +222,17 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     per value head (the Qwen3-Next / Qwen3.5 gated RMSNorm with
     ``norm_before_gate=True``), where ``gate`` is ``[T, HV, V]`` or
     ``[T, HV * V]`` and ``act`` is ``"silu"`` or ``"sigmoid"``.
+
+    ``norm_counter`` is int32 scratch of at least ``T * HV`` elements that
+    must be zero before the first call; every call leaves it zero. Without
+    it, each call allocates and zeroes one, so pass a persistent buffer when
+    the launch overhead matters.
+
+    With ``out_fp4`` (uint8 ``[T, HV * V // 2]``) and ``out_scale`` (uint8
+    ``[T, HV * V // 32]``), the normalized output is instead quantized to
+    MXFP4 with unshuffled per-1x32 e8m0 scales, the layout
+    ``fused_rms_gated_mxfp4_quant`` writes, and the returned output holds the
+    raw, un-normalized ``o``.
     """
     # Spelled as raised ``AssertionError``s rather than ``assert`` statements,
     # keeping the type a caller may already handle while ``python -O`` can no
@@ -267,6 +281,43 @@ def fused_rearrange_sigmoid_gated_delta_rule(
                 f"{tuple(gate.shape)} strides {gate.stride()}"
             )
         stride_gate_tok, stride_gate_head = gate.stride(0), gate.stride(1)
+        if V & (V - 1) or V < 32:
+            raise ValueError(
+                f"the gated-norm epilogue needs a power-of-2 V >= 32, got {V}"
+            )
+        T_tok = qkv.shape[0]
+        if norm_counter is None:
+            norm_counter = torch.zeros(T_tok * HV, dtype=torch.int32, device=qkv.device)
+        elif (
+            norm_counter.dtype != torch.int32
+            or not norm_counter.is_contiguous()
+            or norm_counter.numel() < T_tok * HV
+        ):
+            raise ValueError(
+                f"norm_counter must be contiguous int32 with >= {T_tok * HV} "
+                f"elements, got {norm_counter.dtype} {tuple(norm_counter.shape)}"
+            )
+    if (out_fp4 is None) != (out_scale is None):
+        raise ValueError("out_fp4 and out_scale go together")
+    if out_fp4 is not None:
+        if not fuse_gated_norm:
+            raise ValueError("out_fp4 needs norm_weight")
+        T_tok = qkv.shape[0]
+        for name, t, cols in (
+            ("out_fp4", out_fp4, HV * V // 2),
+            ("out_scale", out_scale, HV * V // 32),
+        ):
+            if (
+                t.dtype != torch.uint8
+                or not t.is_contiguous()
+                or t.dim() != 2
+                or t.shape[0] < T_tok
+                or t.shape[1] != cols
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous uint8 [>= {T_tok}, {cols}], got "
+                    f"{t.dtype} {tuple(t.shape)}"
+                )
 
     # FlyDSL port (opt-in). Only the speculative-verify shape is routed;
     # everything else falls through to Triton below unchanged.
@@ -308,17 +359,11 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     K = head_k_dim
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
 
-    BK = triton.next_power_of_2(K)
-    BV = (
-        triton.next_power_of_2(V)
-        if fuse_gated_norm
-        else min(triton.next_power_of_2(V), 32)
-    )
+    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    # A whole head per program: 8 warps beat 4 and 16 at N=1-64 on MI355X.
-    num_warps = 8 if fuse_gated_norm else 4
+    num_warps = 4
 
     if inplace_final_state and ssm_state_indices is None:
         raise ValueError(
@@ -372,6 +417,9 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         norm_weight=norm_weight,
         gate=gate,
         norm_eps=norm_eps,
+        norm_counter=norm_counter,
+        out_fp4=out_fp4,
+        out_scale=out_scale,
         N=N,
         T=T,
         B=B,

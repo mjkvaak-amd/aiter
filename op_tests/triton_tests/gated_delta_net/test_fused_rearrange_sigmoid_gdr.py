@@ -228,7 +228,8 @@ def _ref_gated_rmsnorm(o, weight, gate, eps, activation):
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize("gate_2d", [False, True])
 @pytest.mark.parametrize(
-    "T,H,HV,D", [(1, 2, 4, 128), (4, 4, 8, 128), (6, 8, 24, 128), (5, 2, 2, 64)]
+    "T,H,HV,D",
+    [(1, 2, 4, 128), (4, 4, 8, 128), (6, 8, 24, 128), (64, 8, 24, 128), (5, 2, 2, 64)],
 )
 def test_fused_rearrange_sigmoid_gdr_gated_norm(T, H, HV, D, activation, gate_2d):
     """Decode-style call (one token per sequence, in-place state) with the
@@ -303,3 +304,109 @@ def test_fused_rearrange_sigmoid_gdr_gated_norm(T, H, HV, D, activation, gate_2d
         o_tr.reshape(T, HV, V).float(), expected, rtol=0.03, atol=0.03
     )
     torch.testing.assert_close(state.float(), state_ref.float(), rtol=0.05, atol=0.02)
+
+
+def _decode_inputs(T, H, HV, D, seed, device="cuda", dtype=torch.bfloat16):
+    K = V = D
+    key_dim, value_dim = H * K, HV * V
+    g = torch.Generator(device=device).manual_seed(seed)
+
+    def rnd(*shape, scale=1.0, dt=dtype):
+        return (torch.randn(*shape, device=device, generator=g) * scale).to(dt)
+
+    num_slots = T + 3
+    return {
+        "qkv": rnd(T, key_dim * 2 + value_dim, scale=0.05),
+        "A_log": rnd(HV, scale=0.02, dt=torch.float32).clamp(-2.0, 0.5),
+        "a": rnd(T, HV, scale=0.05).clamp(-1.0, 1.0),
+        "b": rnd(T, HV, scale=0.05).clamp(-1.0, 1.0),
+        "dt_bias": rnd(HV, scale=0.005).clamp(-0.5, 0.5),
+        "weight": (1.0 + rnd(V, scale=0.1, dt=torch.float32)).to(dtype),
+        "z": rnd(T, HV * V),
+        "state": rnd(num_slots, HV, V, K, scale=0.05),
+        "slots": torch.randperm(num_slots, device=device, generator=g)[:T].to(
+            torch.int32
+        ),
+        "cu_seqlens": torch.arange(T + 1, device=device, dtype=torch.int32),
+        "key_dim": key_dim,
+        "value_dim": value_dim,
+    }
+
+
+@cuda_ok
+@pytest.mark.parametrize("activation", ["silu", "sigmoid"])
+@pytest.mark.parametrize(
+    "T,H,HV,D",
+    [
+        (1, 8, 24, 128),
+        (4, 8, 24, 128),
+        (31, 8, 24, 128),
+        (64, 8, 24, 128),
+        (3, 2, 4, 64),
+    ],
+)
+def test_fused_rearrange_sigmoid_gdr_gated_norm_mxfp4(T, H, HV, D, activation):
+    """MXFP4 epilogue: bytes and scales match the separate gated norm + quant
+    applied to the kernel's own raw output, the counter is left zeroed, and a
+    repeat call on the same counter gives the same result."""
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    device, dtype, eps = "cuda", torch.bfloat16, 1e-6
+    V = D
+    inp = _decode_inputs(T, H, HV, D, seed=T * 7 + HV)
+    counter = torch.zeros(T * HV, dtype=torch.int32, device=device)
+
+    def run(state):
+        core = torch.empty(T, HV, V, device=device, dtype=dtype)
+        x_q = torch.empty(T, HV * V // 2, dtype=torch.uint8, device=device)
+        x_s = torch.empty(T, HV * V // 32, dtype=torch.uint8, device=device)
+        o, _ = fused_rearrange_sigmoid_gated_delta_rule(
+            inp["A_log"],
+            inp["a"],
+            inp["b"],
+            inp["dt_bias"],
+            inp["qkv"],
+            inp["key_dim"],
+            inp["value_dim"],
+            D,
+            V,
+            initial_state=state,
+            inplace_final_state=True,
+            cu_seqlens=inp["cu_seqlens"],
+            ssm_state_indices=inp["slots"],
+            use_qk_l2norm_in_kernel=True,
+            core_attn_out=core,
+            norm_weight=inp["weight"],
+            norm_eps=eps,
+            gate=inp["z"],
+            gate_activation=activation,
+            norm_counter=counter,
+            out_fp4=x_q,
+            out_scale=x_s,
+        )
+        return o.reshape(T, HV * V), x_q, x_s
+
+    state0 = inp["state"]
+    o1, q1, s1 = run(state0.clone())
+    assert int(counter.abs().sum()) == 0
+    o2, q2, s2 = run(state0.clone())
+    assert int(counter.abs().sum()) == 0
+    torch.testing.assert_close(o2, o1, rtol=0, atol=0)
+    torch.testing.assert_close(q2, q1, rtol=0, atol=0)
+    torch.testing.assert_close(s2, s1, rtol=0, atol=0)
+
+    y = _ref_gated_rmsnorm(
+        o1.view(T, HV, V), inp["weight"], inp["z"].view(T, HV, V), eps, activation
+    ).to(dtype)
+    q_ref = torch.empty_like(q1)
+    s_ref = torch.empty_like(s1)
+    dynamic_mxfp4_quant(
+        y.view(T * HV, V),
+        x_fp4=q_ref.view(T * HV, V // 2),
+        blockscale_e8m0=s_ref.view(T * HV, V // 32),
+        backend="triton",
+    )
+    # The fp32 rsqrt differs in the last ulp from torch's, which can move a
+    # value across a rounding boundary of the bf16 activation or of E2M1.
+    assert (s1 != s_ref).float().mean().item() < 0.01
+    assert (q1 != q_ref).float().mean().item() < 0.01
