@@ -46,9 +46,8 @@ from aiter.ops.flydsl.kernels.gdr_prefill import compile_chunk_gated_delta_h
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter_worker_limits import adopt_legacy_max_jobs
 
-# AOT compiles without a device; identity work-group order. Runtime kernels
-# specialize on the queried XCD count, so they miss this cache entry.
-AOT_NUM_XCDS = 1
+# Matches the MI355X device query; a device reporting another count JIT-compiles on first use.
+AOT_NUM_XCDS = 8
 CHUNK_GDN_H_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_fwd_h_flydsl_opt"
 
