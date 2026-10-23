@@ -258,10 +258,11 @@ def torch_rms_gated(x, weight, z, eps, group_size, norm_before_gate, activation)
 @pytest.mark.parametrize("M", [1, 1000])
 @pytest.mark.parametrize("N, group_size", [(3072, 128), (256, None), (4096, None)])
 @pytest.mark.parametrize(
-    "norm_before_gate, activation, dtype, transpose_scale",
+    "norm_before_gate, activation, dtype, transpose_scale, hadamard_rotate",
     [
-        (True, "sigmoid", torch.bfloat16, True),
-        (False, "silu", torch.float16, False),
+        (True, "sigmoid", torch.bfloat16, True, False),
+        (False, "silu", torch.float16, False, False),
+        (True, "sigmoid", torch.bfloat16, False, True),
     ],
 )
 def test_fused_rms_gated_mxfp4_quant(
@@ -272,6 +273,7 @@ def test_fused_rms_gated_mxfp4_quant(
     activation: str,
     dtype,
     transpose_scale: bool,
+    hadamard_rotate: bool,
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -283,9 +285,16 @@ def test_fused_rms_gated_mxfp4_quant(
     w = torch.randn(G, dtype=dtype, device="cuda")
 
     y_torch = torch_rms_gated(x, w, z, 1e-6, G, norm_before_gate, activation)
-    y_fp4_torch, y_scales_torch = torch_dynamic_mxfp4_quant(
-        y_torch.to(dtype).to(torch.float32)
-    )
+    if hadamard_rotate:
+        y_fp4_torch, y_scales_torch = per_1x32_f4_quant_hip(
+            y_torch.to(dtype), hadamard_rotate=True
+        )
+        y_fp4_torch = y_fp4_torch.view(torch.uint8)
+        y_scales_torch = y_scales_torch.view(torch.uint8)
+    else:
+        y_fp4_torch, y_scales_torch = torch_dynamic_mxfp4_quant(
+            y_torch.to(dtype).to(torch.float32)
+        )
     y_fp4, y_scales = fused_rms_gated_mxfp4_quant(
         x,
         w,
@@ -295,6 +304,7 @@ def test_fused_rms_gated_mxfp4_quant(
         activation=activation,
         group_size=group_size,
         transpose_scale=transpose_scale,
+        hadamard_rotate=hadamard_rotate,
     )
 
     assert y_fp4.shape == (M, N // 2) and y_scales.shape == (M, N // 32)
