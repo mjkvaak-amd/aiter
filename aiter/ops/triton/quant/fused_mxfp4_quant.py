@@ -246,6 +246,10 @@ def fused_rms_gated_mxfp4_quant(
         raise ValueError(
             f"activation must be 'silu', 'swish' or 'sigmoid', got {activation!r}"
         )
+    if hadamard_rotate and get_arch() != "gfx950":
+        raise ValueError(
+            f"hadamard_rotate requires gfx950 hardware FP4 conversion, got {get_arch()}"
+        )
     M, N = x.shape
     G = N if group_size is None else int(group_size)
     if G <= 0 or N % G != 0 or G % MXFP4_QUANT_BLOCK_SIZE != 0:

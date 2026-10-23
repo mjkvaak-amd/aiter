@@ -277,6 +277,8 @@ def test_fused_rms_gated_mxfp4_quant(
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+    if hadamard_rotate and arch_info.get_arch() != "gfx950":
+        pytest.skip("hadamard_rotate requires gfx950")
 
     torch.manual_seed(0)
     G = N if group_size is None else group_size
