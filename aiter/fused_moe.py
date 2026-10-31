@@ -3627,8 +3627,8 @@ def get_2stage_cfgs(
             logger.warning(f"Fmoe tuning not support for {keys}")
 
     # A padded call (stored inter_dim, zero-filled intermediate_pad) can reuse a
-    # row tuned at the logical width, but only a FLAT MXFP4 1-stage row: those
-    # kernels launch over the logical columns and stride over the stored ones.
+    # row tuned at the logical width, but only a FLAT or EMSORT MXFP4 1-stage row:
+    # those kernels launch over the logical columns and stride over the stored ones.
     # Every other kernel computes over the full stored width it was tuned for.
     if (
         cfg is None
@@ -3649,11 +3649,11 @@ def get_2stage_cfgs(
         if (
             logical_cfg is not None
             and logical_cfg.get("run_1stage") == 1
-            and logical_cfg.get("flat") == 1
+            and logical_cfg.get("flat") in (1, 2)
         ):
             cfg = logical_cfg
             logger.info(
-                f"[fused_moe] using the FLAT row tuned at inter_dim="
+                f"[fused_moe] using the FLAT/EMSORT row tuned at inter_dim="
                 f"{inter_dim - intermediate_pad} for {keys} with "
                 f"intermediate_pad={intermediate_pad}"
             )
