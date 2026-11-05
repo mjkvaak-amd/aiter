@@ -662,8 +662,40 @@ def _run_direct_k1(inp, hc_count, label, **kwargs):
 
 
 def _run_direct_k1_untiled_tokens():
-    """A nearest tuned split-K tile must not overrun a direct M=224 call."""
+    """A nearest tuned split-K tile must not overrun a direct M=224 call.
+
+    Row counts no tile divides are rejected; ``gemm_pad`` makes them valid.
+    """
     _run_direct_k1(_make_inputs(224, seed=18), HC, "direct_k1[M=224]")
+    tokens = 100
+    inp = _make_inputs(tokens, seed=19)
+    for split_k in ("auto", 1, 4):
+        _expect_value_error(
+            f"direct_k1[M={tokens}][sk={split_k}]",
+            lambda split_k=split_k: _run_direct_k1(inp, HC, "unused", split_k=split_k),
+        )
+        merged = merge_gr_two_stage_weight(inp["w_down"], inp["w_inject"], HC)
+        r2, packed = flydsl_k1_combine_norm_down(
+            inp["residual"],
+            inp["block_output"],
+            inp["injection"],
+            inp["norm_weight"],
+            merged,
+            LOWRANK,
+            HC,
+            EPS,
+            split_k=split_k,
+            gemm_pad=128,
+        )
+        torch.cuda.synchronize()
+        _check_direct_k1(
+            inp,
+            merged,
+            HC,
+            r2[:tokens],
+            packed[:tokens],
+            f"direct_k1[M={tokens}][gemm_pad=128][sk={split_k}]",
+        )
 
 
 def _run_wide_stream_lds():
@@ -742,6 +774,12 @@ def _run_combine_and_mix_shape(inp, hc_count, fold_w, label):
 
 def _run_pipeline_depth():
     """Deep pipelines must cover their preload; short K is rejected, not read."""
+    if get_gfx() != "gfx950":
+        # gfx942 cannot fit an exact-preload pipeline: block_k=256 overflows
+        # its 64 KiB LDS, and block_k=128 needs stages >= 5, which exceeds the
+        # GEMM's 63-load vmcnt budget.
+        print("[skip] pipe_depth: no exact-preload config fits gfx942")
+        return
     # stream_dim=512, block_k=256 -> 4 K tiles: 5 stages preload exactly 4.
     inp = _make_shape_inputs(64, 2, 512, seed=33)
     kwargs = {"split_k": 1, "block_k": 256, "dn_block_m": 32, "use_tuned": False}
