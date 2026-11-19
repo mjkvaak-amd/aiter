@@ -791,6 +791,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 intermediate_pad,
                 ", inter_dim=",
                 inter_dim);
+    // Only the MXFP4 SiLU/GELU FLAT and EMSORT tiles are validated on the logical
+    // grid. Every other kernel runs over the stored width, which the zero-filled
+    // pad keeps exact.
+    const bool silu_or_gelu = act == ActivationType::Silu || act == ActivationType::Gelu;
+    int launch_pad          = 0;
 
     if(gate->dtype() == AITER_DTYPE_u32 || gate->dtype() == AITER_DTYPE_i32) // int4
     {
@@ -837,8 +842,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
-        impl_ptr = get_heuristic_kernel(
-            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, model_dim, intermediate_pad);
+        launch_pad = silu_or_gelu ? intermediate_pad : 0;
+        impl_ptr   = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, model_dim, launch_pad);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
     }
@@ -860,8 +866,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
-        impl_ptr = get_heuristic_kernel(
-            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, model_dim, intermediate_pad);
+        launch_pad = silu_or_gelu ? intermediate_pad : 0;
+        impl_ptr   = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, model_dim, launch_pad);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
     }
@@ -929,7 +936,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                                   fc2_scale,
                                   fc2_smooth_scale,
                                   stream,
-                                  intermediate_pad);
+                                  launch_pad);
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
